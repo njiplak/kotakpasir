@@ -1,0 +1,22 @@
+# Build stage
+FROM golang:1.25-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags "-s -w" \
+    -o /out/kpproxy \
+    ./cmd/kpproxy
+
+# Runtime stage — distroless with busybox for diagnosability + healthcheck.
+# Keeps the same security posture (no package manager, no userland tools by default
+# beyond busybox) and lets operators `docker exec` a shell to debug.
+FROM gcr.io/distroless/static-debian12:debug-nonroot
+COPY --from=build /out/kpproxy /kpproxy
+USER nonroot:nonroot
+EXPOSE 8080
+HEALTHCHECK --interval=10s --timeout=2s --start-period=3s --retries=3 \
+  CMD ["/busybox/wget","-q","-O-","--timeout=1","http://127.0.0.1:8080/_health"]
+ENTRYPOINT ["/kpproxy"]

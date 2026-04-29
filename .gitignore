@@ -1,0 +1,28 @@
+# Local env (commit .env.example, never .env)
+.env
+.env.local
+.env.*.local
+
+# SQLite databases (and WAL/SHM sidecars)
+*.db
+*.db-shm
+*.db-wal
+
+# Build artifacts at repo root
+/kp
+/kpd
+/kpmcp
+
+# Go test/build cache
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/

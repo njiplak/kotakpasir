@@ -1,0 +1,67 @@
+# kotakpasir policy file. Copy to kotakpasir.yaml and edit.
+# Path is set via KP_POLICY_FILE or --policy.
+# When no file is loaded, hardcoded defaults are used (see policy.Default).
+
+version: 1
+
+# Defaults applied when a request omits the field.
+defaults:
+  cpus: 1.0
+  memory_mb: 512
+  pids_limit: 256
+  user: "1000:1000"
+  read_only: true
+  network_mode: none      # none | bridge
+  ttl: 0s                 # 0 = no expiry. e.g. 30m, 2h, 24h
+  runtime: ""             # "" | runc | runsc | kata
+
+# Image allowlist. Empty list = allow any image (NOT recommended in prod).
+# Pin tags or digests; wildcards are intentionally unsupported.
+images:
+  - name: alpine:latest
+    description: "Tiny shell sandbox"
+    pool: 3                 # keep 3 pre-warmed; sub-50ms creates for default requests
+
+  - name: python:3.12-slim
+    description: "Python data tasks"
+    cpus: 2.0
+    memory_mb: 1024
+    egress:
+      mode: allowlist       # none | allowlist
+      hosts:
+        - api.openai.com
+        - api.anthropic.com
+        - pypi.org
+        - files.pythonhosted.org
+    # No pool: pool is incompatible with egress.allowlist (each sandbox needs its own proxy).
+
+  - name: node:20-alpine
+    description: "Node tasks"
+    egress:
+      mode: allowlist
+      hosts:
+        - registry.npmjs.org
+
+# Named templates: agents create with profile=python-data instead of
+# repeating image/limits/egress every time.
+profiles:
+  python-data:
+    image: python:3.12-slim
+    cpus: 2.0
+    memory_mb: 2048
+    ttl: 30m
+
+  shell-only:
+    image: alpine:latest
+    cpus: 0.5
+    memory_mb: 256
+
+# Global egress policy applies when an image has no rules of its own.
+egress:
+  default:
+    mode: none
+  # Always blocked, even if listed in any allowlist (cloud metadata, link-local, etc.)
+  global_deny:
+    - 169.254.169.254
+    - metadata.google.internal
+    - metadata.aws.internal
