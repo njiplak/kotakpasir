@@ -122,6 +122,14 @@ func (p *Pool) Image() string {
 	return p.cfg.Image
 }
 
+// Spec returns the runtime.Spec used to warm entries in this pool. Read-only —
+// returned by value, but contained slices/maps are not deep-copied. Used by
+// the manager to decide whether a reloaded policy entry can reuse the
+// existing pool or needs to drain+rewarm.
+func (p *Pool) Spec() rt.Spec {
+	return p.spec
+}
+
 func (p *Pool) spawn(ctx context.Context) error {
 	handle, err := p.rt.Create(ctx, p.spec)
 	if err != nil {

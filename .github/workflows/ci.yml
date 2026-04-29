@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.25.7"
+
+jobs:
+  vet:
+    name: vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: go vet ./...
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: go test ./... -count=1 -race
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: go build ./...
+
+  # Integration suite: hits a real Docker daemon. Gated on KP_DOCKER_TESTS=1
+  # so contributors without Docker can still get green CI on the unit jobs.
+  # Build the proxy image before running because the egress conformance test
+  # spawns it, and pre-pull alpine:latest so the lifecycle test doesn't pay
+  # an opportunistic pull on a slow network path.
+  integration:
+    name: integration (docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Build proxy image
+        run: docker build -f Dockerfile.kpproxy -t kotakpasir/proxy:dev .
+      - name: Pull alpine:latest
+        run: docker pull alpine:latest
+      - name: Run integration suite
+        env:
+          KP_DOCKER_TESTS: "1"
+        run: go test ./... -count=1 -timeout 10m

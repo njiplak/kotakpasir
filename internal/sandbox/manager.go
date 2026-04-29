@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"maps"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -27,10 +28,17 @@ import (
 const DefaultLogBufferBytes = 256 * 1024
 
 type Manager struct {
-	rt     rt.Runtime
-	store  Store
-	policy *policy.Policy
-	pools  map[string]*pool.Pool
+	rt    rt.Runtime
+	store Store
+
+	// mu guards policy, pools, and started. RLocked on the read paths
+	// (Create, Health) so a long-running ReplacePolicy doesn't stall them;
+	// callers grab a snapshot of (policy, pools) and release the lock before
+	// doing runtime work.
+	mu      sync.RWMutex
+	policy  *policy.Policy
+	pools   map[string]*pool.Pool
+	started bool
 
 	metrics metrics.Recorder
 
@@ -78,8 +86,18 @@ func NewManager(opts Options) (*Manager, error) {
 		logCapBytes: logCap,
 		logs:        make(map[string]*logbuf.Buffer),
 	}
-	m.buildPools()
+	m.pools = m.buildPools(opts.Policy)
 	return m, nil
+}
+
+// snapshot returns the current policy and pools under a read lock. Callers
+// should treat the returned values as read-only and use them for the rest of
+// a single operation, so a concurrent ReplacePolicy can't shift the view
+// out from under them.
+func (m *Manager) snapshot() (*policy.Policy, map[string]*pool.Pool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.policy, m.pools
 }
 
 // logBufferFor returns the buffer for a sandbox, creating it lazily on first
@@ -105,40 +123,44 @@ func (m *Manager) dropLogBuffer(id string) {
 	delete(m.logs, id)
 }
 
-// buildPools constructs a Pool for each image in the policy that has
-// pool > 0 and a compatible egress mode.
-func (m *Manager) buildPools() {
-	for _, img := range m.policy.Images {
+// buildPools constructs a Pool for each image in the given policy that has
+// pool > 0 and a compatible egress mode. Returned but not started — Start
+// (or ReplacePolicy when the manager is already started) is responsible for
+// warming entries.
+func (m *Manager) buildPools(pol *policy.Policy) map[string]*pool.Pool {
+	out := make(map[string]*pool.Pool)
+	for _, img := range pol.Images {
 		if img.Pool <= 0 {
 			continue
 		}
 		if img.Egress != nil && img.Egress.Mode != "" && img.Egress.Mode != policy.EgressNone {
 			continue
 		}
-		spec := m.poolSpecFor(img)
-		m.pools[img.Name] = pool.New(m.rt, pool.Config{
+		spec := poolSpecFor(pol, img)
+		out[img.Name] = pool.New(m.rt, pool.Config{
 			Image:  img.Name,
 			Target: img.Pool,
 		}, spec)
 	}
+	return out
 }
 
 // poolSpecFor builds the runtime.Spec used to warm pool entries for an image.
 // Resource limits come from the image entry if set, otherwise policy defaults.
 // Pool entries are created without per-sandbox identifiers — those are assigned
 // only when the entry is claimed.
-func (m *Manager) poolSpecFor(img policy.Image) rt.Spec {
-	cpus := cmp.Or(img.Cpus, m.policy.Defaults.Cpus)
-	memMB := cmp.Or(img.MemoryMB, m.policy.Defaults.MemoryMB)
+func poolSpecFor(pol *policy.Policy, img policy.Image) rt.Spec {
+	cpus := cmp.Or(img.Cpus, pol.Defaults.Cpus)
+	memMB := cmp.Or(img.MemoryMB, pol.Defaults.MemoryMB)
 	return rt.Spec{
 		Image:       img.Name,
 		Cpus:        cpus,
 		MemoryMB:    memMB,
-		PidsLimit:   m.policy.Defaults.PidsLimit,
-		User:        m.policy.Defaults.User,
-		ReadOnly:    m.policy.Defaults.ReadOnly,
-		NetworkMode: m.policy.Defaults.NetworkMode,
-		RuntimeName: m.policy.Defaults.Runtime,
+		PidsLimit:   pol.Defaults.PidsLimit,
+		User:        pol.Defaults.User,
+		ReadOnly:    pol.Defaults.ReadOnly,
+		NetworkMode: pol.Defaults.NetworkMode,
+		RuntimeName: pol.Defaults.Runtime,
 	}
 }
 
@@ -207,7 +229,8 @@ func (m *Manager) Health(ctx context.Context) HealthReport {
 		addCheck("runtime", nil, true)
 	}
 
-	for image, p := range m.pools {
+	_, pools := m.snapshot()
+	for image, p := range pools {
 		// A pool is healthy if it has at least one warm entry available — the
 		// async refill goroutine handles the upper bound. Zero with a target
 		// > 0 means everything's claimed AND the refill hasn't caught up.
@@ -231,13 +254,14 @@ func (m *Manager) Health(ctx context.Context) HealthReport {
 // kpd runs and pre-pulls every declared image before warming, so a cold registry
 // surfaces as explicit log lines instead of a silent pool-warmup stall.
 func (m *Manager) Start(ctx context.Context) error {
+	pol, pools := m.snapshot()
 	if oc, ok := m.rt.(orphanCleaner); ok {
 		if err := oc.CleanPoolOrphans(ctx); err != nil {
 			slog.Warn("pool orphan cleanup", "err", err)
 		}
 	}
 	if ie, ok := m.rt.(imageEnsurer); ok {
-		for _, img := range m.policy.Images {
+		for _, img := range pol.Images {
 			start := time.Now()
 			pulled, err := ie.EnsureImage(ctx, img.Name)
 			if err != nil {
@@ -250,20 +274,120 @@ func (m *Manager) Start(ctx context.Context) error {
 			}
 		}
 	}
-	for image, p := range m.pools {
+	for image, p := range pools {
 		if err := p.Start(ctx); err != nil {
 			return fmt.Errorf("pool %s: %w", image, err)
 		}
-		slog.Info("warm pool ready", "image", image, "target", m.pools[image].Available())
+		slog.Info("warm pool ready", "image", image, "target", p.Available())
 	}
+	m.mu.Lock()
+	m.started = true
+	m.mu.Unlock()
 	return nil
+}
+
+// ReplacePolicy swaps in a new policy and reconciles the warm pool set to
+// match it. In-flight Create calls keep their original (policy, pools)
+// snapshot — only requests that arrive after the swap see the new policy.
+//
+// Pool reconciliation is by image name and effective spec: pools whose
+// image+spec is unchanged are kept as-is; new pools are started; removed
+// or changed pools are shut down asynchronously so the swap doesn't block
+// on docker round-trips.
+//
+// If the manager has not yet been started, new pools are not eagerly warmed
+// here — the next call to Start will warm them.
+func (m *Manager) ReplacePolicy(ctx context.Context, newPolicy *policy.Policy) error {
+	if newPolicy == nil {
+		return errors.New("policy is required")
+	}
+	if err := newPolicy.Validate(); err != nil {
+		return err
+	}
+
+	m.mu.RLock()
+	oldPools := m.pools
+	started := m.started
+	m.mu.RUnlock()
+
+	desired := m.buildPools(newPolicy)
+
+	// Reuse pools whose image and spec are byte-identical with the previous
+	// version, so retained images don't pay a needless drain+warm cycle.
+	merged := make(map[string]*pool.Pool, len(desired))
+	toShutdown := make([]*pool.Pool, 0)
+	toStart := make([]*pool.Pool, 0)
+
+	for image, newP := range desired {
+		if oldP, ok := oldPools[image]; ok && samePoolSpec(oldP, newP) {
+			merged[image] = oldP
+			continue
+		}
+		merged[image] = newP
+		toStart = append(toStart, newP)
+	}
+	for image, oldP := range oldPools {
+		if _, kept := merged[image]; kept && merged[image] == oldP {
+			continue
+		}
+		toShutdown = append(toShutdown, oldP)
+	}
+
+	if started {
+		started := make([]*pool.Pool, 0, len(toStart))
+		for _, p := range toStart {
+			if err := p.Start(ctx); err != nil {
+				// Roll back: shut down anything we already warmed for the new
+				// policy; leave the manager on the previous (policy, pools).
+				for _, sp := range started {
+					_ = sp.Shutdown(context.Background())
+				}
+				return fmt.Errorf("warm pool %s: %w", p.Image(), err)
+			}
+			started = append(started, p)
+			slog.Info("warm pool ready", "image", p.Image(), "target", p.Available())
+		}
+	}
+
+	m.mu.Lock()
+	m.policy = newPolicy
+	m.pools = merged
+	m.mu.Unlock()
+
+	if len(toShutdown) > 0 {
+		go func(pools []*pool.Pool) {
+			for _, p := range pools {
+				if err := p.Shutdown(context.Background()); err != nil {
+					slog.Warn("retired pool shutdown", "image", p.Image(), "err", err)
+				}
+			}
+		}(toShutdown)
+	}
+
+	slog.Info("policy reloaded",
+		"images", len(newPolicy.Images),
+		"profiles", len(newPolicy.Profiles),
+		"pools_added", len(toStart),
+		"pools_removed", len(toShutdown),
+	)
+	return nil
+}
+
+// samePoolSpec returns true when two pool entries warm the same effective
+// container spec. Used by ReplacePolicy to skip churn for unchanged pools.
+func samePoolSpec(a, b *pool.Pool) bool {
+	if a.Image() != b.Image() || a.Target() != b.Target() {
+		return false
+	}
+	return reflect.DeepEqual(a.Spec(), b.Spec())
 }
 
 // Shutdown drains every pool. Use a background context — typically called on
 // kpd shutdown when the parent context is already canceled.
 func (m *Manager) Shutdown(ctx context.Context) error {
+	_, pools := m.snapshot()
 	var errs []error
-	for image, p := range m.pools {
+	for image, p := range pools {
 		if err := p.Shutdown(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("pool %s: %w", image, err))
 		}
@@ -272,7 +396,8 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 }
 
 func (m *Manager) Create(ctx context.Context, opts CreateOptions) (Sandbox, error) {
-	resolved, err := m.policy.Resolve(policy.Request{
+	pol, pools := m.snapshot()
+	resolved, err := pol.Resolve(policy.Request{
 		Profile:  opts.Profile,
 		Image:    opts.Image,
 		Cmd:      opts.Cmd,
@@ -324,7 +449,7 @@ func (m *Manager) Create(ctx context.Context, opts CreateOptions) (Sandbox, erro
 
 	log := slog.With("sandbox_id", sb.ID, "image", resolved.Image)
 
-	if id, ok := m.tryClaim(ctx, resolved); ok {
+	if id, ok := m.tryClaim(ctx, pol, pools, resolved); ok {
 		sb.RuntimeID = id
 		sb.State = StateRunning
 		if err := m.store.Put(ctx, sb); err != nil {
@@ -376,32 +501,34 @@ func (m *Manager) refreshActive(ctx context.Context) {
 
 // tryClaim returns a warm container id if the resolved spec exactly matches
 // what the pool was warmed for. Mismatched requests cold-start instead.
-func (m *Manager) tryClaim(ctx context.Context, resolved policy.Resolved) (string, bool) {
-	p, ok := m.pools[resolved.Image]
+// Operates on the snapshot (pol, pools) so a concurrent ReplacePolicy can't
+// shift the view mid-request.
+func (m *Manager) tryClaim(ctx context.Context, pol *policy.Policy, pools map[string]*pool.Pool, resolved policy.Resolved) (string, bool) {
+	p, ok := pools[resolved.Image]
 	if !ok {
 		return "", false
 	}
-	if !m.poolMatchesResolved(resolved) {
+	if !poolMatchesResolved(pol, resolved) {
 		return "", false
 	}
 	return p.Get(ctx)
 }
 
-func (m *Manager) poolMatchesResolved(resolved policy.Resolved) bool {
+func poolMatchesResolved(pol *policy.Policy, resolved policy.Resolved) bool {
 	if resolved.Egress.Mode != "" && resolved.Egress.Mode != policy.EgressNone {
 		return false
 	}
-	img, ok := m.findImage(resolved.Image)
+	img, ok := findImage(pol, resolved.Image)
 	if !ok {
 		return false
 	}
-	expectedCpus := cmp.Or(img.Cpus, m.policy.Defaults.Cpus)
-	expectedMem := cmp.Or(img.MemoryMB, m.policy.Defaults.MemoryMB)
+	expectedCpus := cmp.Or(img.Cpus, pol.Defaults.Cpus)
+	expectedMem := cmp.Or(img.MemoryMB, pol.Defaults.MemoryMB)
 	return resolved.Cpus == expectedCpus && resolved.MemoryMB == expectedMem
 }
 
-func (m *Manager) findImage(name string) (policy.Image, bool) {
-	for _, img := range m.policy.Images {
+func findImage(pol *policy.Policy, name string) (policy.Image, bool) {
+	for _, img := range pol.Images {
 		if img.Name == name {
 			return img, true
 		}

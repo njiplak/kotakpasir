@@ -7,18 +7,6 @@ nothing here is a commitment.
 If you want to pick something up, opening an issue first is a good idea so we
 can sanity-check scope and avoid duplicate work.
 
-## Now
-
-Active work, near-term.
-
-- Hot-reload of policy via `SIGHUP`. The `Manager` needs a `ReplacePolicy` path
-  that's safe under concurrent `Create`. In-flight sandboxes keep their
-  original policy; only new creates see the new one.
-- GitHub Actions: `vet` / `test` / `build`, plus optional integration tests
-  gated by `KP_DOCKER_TESTS=1`.
-- Conformance test gaps — TTL GC end-to-end, pool orphan cleanup, pool latency
-  benchmark, `Manager.Start/Shutdown` ordering.
-
 ## Next
 
 Wanted soon, design mostly clear.

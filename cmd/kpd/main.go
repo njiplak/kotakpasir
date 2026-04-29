@@ -109,6 +109,11 @@ func serve(cmd *cobra.Command, cfg config.Config) error {
 		}
 	}()
 
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	defer signal.Stop(hup)
+	go reloadOnHUP(ctx, hup, mgr, cfg.Policy.File)
+
 	reaper := sandbox.NewReaper(mgr, cfg.Reaper.Interval)
 	go func() {
 		if err := reaper.Run(ctx); err != nil {
@@ -153,4 +158,32 @@ func policySource(path string) string {
 		return "(defaults)"
 	}
 	return path
+}
+
+// reloadOnHUP listens for SIGHUP and reloads the policy file into the manager.
+// Errors during reload (parse, validate, or pool warm-up) are logged and the
+// previous policy stays in effect — kpd never goes down because of a bad
+// reload. Returns when ctx is canceled.
+func reloadOnHUP(ctx context.Context, hup <-chan os.Signal, mgr *sandbox.Manager, path string) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-hup:
+			if path == "" {
+				slog.Warn("SIGHUP received but no policy file is configured (set --policy or KP_POLICY_FILE); ignoring")
+				continue
+			}
+			slog.Info("SIGHUP received, reloading policy", "path", path)
+			pol, err := policy.Load(path)
+			if err != nil {
+				slog.Error("policy reload: load failed", "path", path, "err", err)
+				continue
+			}
+			if err := mgr.ReplacePolicy(ctx, pol); err != nil {
+				slog.Error("policy reload: apply failed", "path", path, "err", err)
+				continue
+			}
+		}
+	}
 }
